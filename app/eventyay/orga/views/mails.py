@@ -32,7 +32,7 @@ from eventyay.common.views.mixins import (
     PermissionRequired,
     Sortable,
 )
-from eventyay.helpers.timezone import format_scheduled_datetime
+from eventyay.helpers.timezone import format_scheduled_datetime, format_timezone_name
 from eventyay.mail.signals import request_pre_send
 from eventyay.orga.forms.mails import (
     DraftRemindersForm,
@@ -86,7 +86,7 @@ class OutboxList(EventPermissionRequired, Sortable, Filterable, PaginationMixin,
     @context
     @cached_property
     def show_tracks(self):
-        return self.request.event.get_feature_flag('use_tracks')
+        return self.request.event.tracks.exists()
 
     @context
     @cached_property
@@ -127,7 +127,7 @@ class SentMail(EventPermissionRequired, Sortable, Filterable, PaginationMixin, L
     @context
     @cached_property
     def show_tracks(self):
-        return self.request.event.get_feature_flag('use_tracks')
+        return self.request.event.tracks.exists()
 
 
 class DraftList(OutboxList):
@@ -447,7 +447,19 @@ class ComposeMailPreview(EventPermissionRequired, View):
                 request.event,
                 ['event', 'submission', 'user', 'slot'],
             )
-            expanded = safe_html.format_map(context_dict)
+            try:
+                expanded = safe_html.format_map(context_dict)
+            except ValueError:
+                return JsonResponse(
+                    {
+                        'error': _(
+                            'Invalid email template! '
+                            'Please check that you don’t have stray { or } somewhere, '
+                            'and that there are no spaces inside the {} blocks.'
+                        )
+                    },
+                    status=400,
+                )
             preview_html = expand_email_variable_chips(expanded, dict(context_dict))
             return JsonResponse({'html': preview_html})
 
@@ -722,7 +734,7 @@ class ComposeMailBaseView(EventPermissionRequired, FormView):
                 _('{count} emails have been scheduled for {datetime} ({timezone}).').format(
                     count=len(result),
                     datetime=format_scheduled_datetime(self.request.event, scheduled_at),
-                    timezone=self.request.event.timezone,
+                    timezone=format_timezone_name(self.request.event.timezone),
                 ),
             )
         elif is_draft:

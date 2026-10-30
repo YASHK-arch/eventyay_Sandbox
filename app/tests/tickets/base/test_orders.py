@@ -29,6 +29,7 @@ from eventyay.base.services.invoices import generate_invoice
 from eventyay.base.services.orders import (
     OrderChangeManager,
     OrderError,
+    _check_date,
     _create_order,
     approve_order,
     cancel_order,
@@ -315,6 +316,35 @@ def test_expiring_paid_invoice(event):
 
 
 @pytest.mark.django_db
+def test_create_external_refund_exact_balance_marks_refund_done(event):
+    order = Order.objects.create(
+        code='FOO',
+        event=event,
+        email='dummy@dummy.test',
+        status=Order.STATUS_PAID,
+        locale='en',
+        datetime=now(),
+        expires=now() + timedelta(days=10),
+        total=Decimal('100.00'),
+    )
+    payment = order.payments.create(
+        provider='banktransfer',
+        state=OrderPayment.PAYMENT_STATE_CONFIRMED,
+        amount=Decimal('120.00'),
+    )
+    assert order.pending_sum == Decimal('-20.00')
+
+    refund = payment.create_external_refund(amount=Decimal('20.00'))
+
+    refund.refresh_from_db()
+    assert refund.state == OrderRefund.REFUND_STATE_DONE
+    order.refresh_from_db()
+    assert order.pending_sum == Decimal('0.00')
+    payment.refresh_from_db()
+    assert payment.state == OrderPayment.PAYMENT_STATE_CONFIRMED
+
+
+@pytest.mark.django_db
 def test_expire_twice(event):
     o2 = Order.objects.create(
         code='FO2',
@@ -539,6 +569,16 @@ class PaymentReminderTests(TestCase):
         assert len(djmail.outbox) == 0
 
     @classscope(attr='o')
+    @pytest.mark.django_db
+    def test_order_payment_term_check_accepts_event_timezone_name(self):
+        self.event.timezone = 'Europe/Berlin'
+        self.event.save()
+        self.event.settings.set('payment_term_last', (now() - timedelta(days=1)).date().isoformat())
+
+        with pytest.raises(OrderError):
+            _check_date(self.event, now())
+
+
     def test_sent_once(self):
         self.event.settings.mail_days_order_expire_warning = 12
         send_expiry_warnings(sender=self.event)

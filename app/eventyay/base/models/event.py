@@ -24,7 +24,6 @@ from django.core.files.storage import default_storage
 from django.core.mail import get_connection
 from django.core.validators import (
     MaxValueValidator,
-    MinLengthValidator,
     MinValueValidator,
     RegexValidator,
 )
@@ -37,7 +36,7 @@ from django.utils.formats import date_format
 from django.utils.functional import cached_property
 from django.utils.html import format_html
 from django.utils.timezone import make_aware, now
-from django.utils.translation import gettext
+from django.utils.translation import gettext, override
 from django.utils.translation import gettext_lazy as _
 from django_scopes import ScopedManager, scope, scopes_disabled
 from i18nfield.fields import I18nCharField, I18nTextField
@@ -81,6 +80,7 @@ from eventyay.talk_rules.event import (
     can_create_events,
     has_any_permission,
     has_talk_permission,
+    is_event_speaker,
     is_event_visible,
 )
 
@@ -525,11 +525,8 @@ class Event(
             'This will be used in URLs, order codes, invoice numbers, and bank transfer references.'
         ),
         validators=[
-            MinLengthValidator(
-                limit_value=2,
-            ),
             RegexValidator(
-                regex='^[a-zA-Z0-9][a-zA-Z0-9.-]*[a-zA-Z0-9]$',
+                regex=r'^[a-zA-Z0-9](?:[a-zA-Z0-9.-]*[a-zA-Z0-9])?\Z',
                 message=_('The slug may only contain letters, numbers, dots and dashes.'),
             ),
             EventSlugBanlistValidator(),
@@ -762,7 +759,8 @@ class Event(
         delete = '{base}delete'
         cfp = '{base}cfp/'
         history = '{base}history/'
-        users = '{base}api/users'
+        speaker_autocomplete = '{base}speaker-autocomplete/'
+        users = '{speaker_autocomplete}'
         mail = '{base}mails/'
         compose_mails = '{mail}compose'
         compose_mails_sessions = '{compose_mails}/sessions/'
@@ -779,12 +777,12 @@ class Event(
         submissions = '{base}submissions/'
         tags = '{submissions}tags/'
         new_tag = '{tags}new/'
-        submission_cards = '{base}submissions/cards/'
         submission_feed = '{base}submissions/feed/'
         new_submission = '{submissions}new'
         feedback = '{submissions}feedback/'
         apply_pending = '{submissions}apply-pending/'
         speakers = '{base}speakers/'
+        new_speaker = '{speakers}new/'
         settings = edit_settings = '{base}settings/'
         review_settings = '{settings}review/'
         feedback_settings = '{settings}feedback/'
@@ -857,7 +855,7 @@ class Event(
         rules_permissions = {
             'orga_access': has_any_permission,
             'talk_orga_access': has_talk_permission,
-            'view': is_event_visible | has_any_permission,
+            'view': is_event_visible | has_any_permission | is_event_speaker,
             'update': can_change_event_settings,
             'create': can_create_events,
         }
@@ -1140,6 +1138,8 @@ class Event(
         )
 
         clone_options = clone_options or {}
+        dest_organizer = self.organizer
+        source_organizer = other.organizer
         clone_common = clone_options.get('clone_common_data', True)
         clone_settings = clone_options.get('clone_settings', True)
         clone_design_texts = clone_options.get('clone_design_texts', True)
@@ -1163,12 +1163,15 @@ class Event(
             self.geo_lat = other.geo_lat
             self.geo_lon = other.geo_lon
             self.currency = other.currency
-            
-            for extra_link in other.extra_links.all():
-                extra_link.pk = None
-                extra_link.event = self
-                extra_link.save()
-                extra_link.log_action('eventyay.object.cloned')
+
+            with scope(event=other):
+                source_extra_links = list(other.extra_links.all())
+            for extra_link in source_extra_links:
+                with scope(event=self):
+                    extra_link.pk = None
+                    extra_link.event = self
+                    extra_link.save()
+                    extra_link.log_action('eventyay.object.cloned')
 
         if other.date_admission:
             self.date_admission = self.date_from + (other.date_admission - other.date_from)
@@ -1203,95 +1206,125 @@ class Event(
                     c.event = self
                     c.save()
                     c.log_action('eventyay.object.cloned')
-    
+
                 for imp in other.product_meta_properties.all():
                     product_meta_properties_map[imp.pk] = imp
                     imp.pk = None
                     imp.event = self
                     imp.save()
                     imp.log_action('eventyay.object.cloned')
-    
-                for i in Product.objects.filter(event=other).prefetch_related('variations'):
-                    vars = list(i.variations.all())
-                    product_map[i.pk] = i
-                    i.pk = None
-                    i.event = self
-                    if i.picture:
-                        i.picture.save(i.picture.name, i.picture)
-                    if i.category_id:
-                        i.category = category_map.get(i.category_id)
-                    if i.tax_rule_id:
-                        i.tax_rule = tax_map.get(i.tax_rule_id)
-                    i.save()
-                    i.log_action('eventyay.object.cloned')
-                    for v in vars:
-                        variation_map[v.pk] = v
-                        v.pk = None
-                        v.product = i
-                        v.save()
-    
-                for imv in ProductMetaValue.objects.filter(product__event=other).prefetch_related('product', 'property'):
-                    imv.pk = None
-                    imv.property = product_meta_properties_map.get(imv.property.pk)
-                    imv.product = product_map.get(imv.product.pk)
-                    imv.save()
-    
-                for ia in ProductAddOn.objects.filter(base_product__event=other).prefetch_related(
-                    'base_product', 'addon_category'
-                ):
-                    ia.pk = None
-                    ia.base_product = product_map.get(ia.base_product.pk)
-                    ia.addon_category = category_map.get(ia.addon_category.pk)
-                    ia.save()
-    
-                for ia in ProductBundle.objects.filter(base_product__event=other).prefetch_related(
-                    'base_product', 'bundled_product', 'bundled_variation'
-                ):
-                    ia.pk = None
-                    ia.base_product = product_map.get(ia.base_product.pk)
-                    ia.bundled_product = product_map.get(ia.bundled_product.pk)
-                    if ia.bundled_variation:
-                        ia.bundled_variation = variation_map.get(ia.bundled_variation.pk)
-                    ia.save()
-    
-                for q in Quota.objects.filter(event=other, subevent__isnull=True).prefetch_related('products', 'variations'):
-                    products = list(q.products.all())
-                    vars = list(q.variations.all())
-                    oldid = q.pk
-                    q.pk = None
-                    q.event = self
-                    q.closed = False
-                    q.save()
-                    q.log_action('eventyay.object.cloned')
-                    for i in products:
-                        if i.pk in product_map:
-                            q.products.add(product_map[i.pk])
-                    for v in vars:
-                        if v.pk in variation_map:
-                            q.variations.add(variation_map[v.pk])
-                    self.products.filter(hidden_if_available_id=oldid).update(hidden_if_available=q)
+
+                with scope(organizer=source_organizer):
+                    source_products = list(Product.objects.filter(event=other))
+                    product_variation_rows = [
+                        (product, list(product.variations.all())) for product in source_products
+                    ]
+                with scope(organizer=dest_organizer):
+                    for i, vars in product_variation_rows:
+                        product_map[i.pk] = i
+                        i.pk = None
+                        i.event = self
+                        if i.picture:
+                            i.picture.save(i.picture.name, i.picture)
+                        if i.category_id:
+                            i.category = category_map.get(i.category_id)
+                        if i.tax_rule_id:
+                            i.tax_rule = tax_map.get(i.tax_rule_id)
+                        if i.free_price:
+                            if i.free_price_min is not None and i.free_price_min < 0:
+                                i.free_price_min = None
+                            if i.free_price_max is not None and i.free_price_max < 0:
+                                i.free_price_max = None
+                        else:
+                            i.free_price_min = None
+                            i.free_price_max = None
+                        i.save()
+                        i.log_action('eventyay.object.cloned')
+                        for v in vars:
+                            variation_map[v.pk] = v
+                            v.pk = None
+                            v.product = i
+                            v.save()
+
+                with scope(organizer=dest_organizer):
+                    for imv in ProductMetaValue.objects.filter(product__event=other).prefetch_related(
+                        'product', 'property'
+                    ):
+                        imv.pk = None
+                        imv.property = product_meta_properties_map.get(imv.property.pk)
+                        imv.product = product_map.get(imv.product.pk)
+                        imv.save()
+
+                    for ia in ProductAddOn.objects.filter(base_product__event=other).prefetch_related(
+                        'base_product', 'addon_category'
+                    ):
+                        ia.pk = None
+                        ia.base_product = product_map.get(ia.base_product.pk)
+                        ia.addon_category = category_map.get(ia.addon_category.pk)
+                        ia.save()
+
+                    for ia in ProductBundle.objects.filter(base_product__event=other).prefetch_related(
+                        'base_product', 'bundled_product', 'bundled_variation'
+                    ):
+                        ia.pk = None
+                        ia.base_product = product_map.get(ia.base_product.pk)
+                        ia.bundled_product = product_map.get(ia.bundled_product.pk)
+                        if ia.bundled_variation:
+                            ia.bundled_variation = variation_map.get(ia.bundled_variation.pk)
+                        ia.save()
+
+                with scope(organizer=source_organizer):
+                    source_quotas = list(
+                        Quota.objects.filter(event=other, subevent__isnull=True)
+                    )
+                    quota_rows = [
+                        (quota, list(quota.products.all()), list(quota.variations.all()))
+                        for quota in source_quotas
+                    ]
+                with scope(organizer=dest_organizer):
+                    for q, products, vars in quota_rows:
+                        oldid = q.pk
+                        q.pk = None
+                        q.event = self
+                        q.closed = False
+                        q.save()
+                        q.log_action('eventyay.object.cloned')
+                        for i in products:
+                            if i.pk in product_map:
+                                q.products.add(product_map[i.pk])
+                        for v in vars:
+                            if v.pk in variation_map:
+                                q.variations.add(variation_map[v.pk])
+                        self.products.filter(hidden_if_available_id=oldid).update(hidden_if_available=q)
 
             if clone_questions:
-                for q in Question.objects.filter(event=other).prefetch_related('products', 'options'):
-                    products = list(q.products.all())
-                    opts = list(q.options.all())
-                    question_map[q.pk] = q
-                    q.pk = None
-                    q.event = self
-                    q.save()
-                    q.log_action('eventyay.object.cloned')
-    
-                    for i in products:
-                        if i.pk in product_map:
-                            q.products.add(product_map[i.pk])
-                    for o in opts:
-                        o.pk = None
-                        o.question = q
-                        o.save()
-    
-                for q in self.questions.filter(dependency_question__isnull=False):
-                    q.dependency_question = question_map[q.dependency_question_id]
-                    q.save(update_fields=['dependency_question'])
+                with scope(organizer=source_organizer):
+                    source_questions = list(
+                        Question.objects.filter(event=other).prefetch_related('products', 'options')
+                    )
+                    question_rows = [
+                        (question, list(question.products.all()), list(question.options.all()))
+                        for question in source_questions
+                    ]
+                with scope(organizer=dest_organizer):
+                    for q, products, opts in question_rows:
+                        question_map[q.pk] = q
+                        q.pk = None
+                        q.event = self
+                        q.save()
+                        q.log_action('eventyay.object.cloned')
+
+                        for i in products:
+                            if i.pk in product_map:
+                                q.products.add(product_map[i.pk])
+                        for o in opts:
+                            o.pk = None
+                            o.question = q
+                            o.save()
+
+                    for q in self.questions.filter(dependency_question__isnull=False):
+                        q.dependency_question = question_map[q.dependency_question_id]
+                        q.save(update_fields=['dependency_question'])
 
             def _walk_rules(rules):
                 if isinstance(rules, dict):
@@ -1308,20 +1341,28 @@ class Event(
                         _walk_rules(i)
 
             if clone_checkin_lists:
-                for cl in other.checkin_lists.filter(subevent__isnull=True).prefetch_related('limit_products'):
-                    products = list(cl.limit_products.all())
-                    checkin_list_map[cl.pk] = cl
-                    cl.pk = None
-                    cl.event = self
-                    rules = cl.rules
-                    _walk_rules(rules)
-                    cl.rules = rules
-                    cl.save()
-                    cl.log_action('eventyay.object.cloned')
-                    for i in products:
-                        if i.pk in product_map:
-                            cl.limit_products.add(product_map[i.pk])
-    
+                with scope(organizer=source_organizer):
+                    source_checkin_lists = list(
+                        other.checkin_lists.filter(subevent__isnull=True).prefetch_related('limit_products')
+                    )
+                    checkin_rows = [
+                        (checkin_list, list(checkin_list.limit_products.all()))
+                        for checkin_list in source_checkin_lists
+                    ]
+                with scope(organizer=dest_organizer):
+                    for cl, products in checkin_rows:
+                        checkin_list_map[cl.pk] = cl
+                        cl.pk = None
+                        cl.event = self
+                        rules = cl.rules
+                        _walk_rules(rules)
+                        cl.rules = rules
+                        cl.save()
+                        cl.log_action('eventyay.object.cloned')
+                        for i in products:
+                            if i.pk in product_map:
+                                cl.limit_products.add(product_map[i.pk])
+
                 if other.seating_plan:
                     if other.seating_plan.organizer_id == self.organizer_id:
                         self.seating_plan = other.seating_plan
@@ -1412,26 +1453,34 @@ class Event(
             from eventyay.base.models.access_code import SubmitterAccessCode
             
             if hasattr(self, 'cfp') and getattr(self.cfp, 'default_type_id', None):
-                self.cfp.default_type = None
-                self.cfp.save(update_fields=['default_type'])
-            
+                with scope(event=self):
+                    self.cfp.default_type = None
+                    self.cfp.save(update_fields=['default_type'])
+
             if clone_session_types_tracks:
-                SubmissionType.objects.filter(event=self).delete()
+                with scope(event=self):
+                    SubmissionType.objects.filter(event=self).delete()
                 submission_type_map = {}
-                for st in other.submission_types.all():
-                    submission_type_map[st.pk] = st
-                    st.pk = None
-                    st.event = self
-                    st.save()
-                    st.log_action('eventyay.object.cloned')
-    
+                with scope(event=other):
+                    source_submission_types = list(other.submission_types.all())
+                for st in source_submission_types:
+                    with scope(event=self):
+                        submission_type_map[st.pk] = st
+                        st.pk = None
+                        st.event = self
+                        st.save()
+                        st.log_action('eventyay.object.cloned')
+
                 track_map = {}
-                for tr in other.tracks.all():
-                    track_map[tr.pk] = tr
-                    tr.pk = None
-                    tr.event = self
-                    tr.save()
-                    tr.log_action('eventyay.object.cloned')
+                with scope(event=other):
+                    source_tracks = list(other.tracks.all())
+                for tr in source_tracks:
+                    with scope(event=self):
+                        track_map[tr.pk] = tr
+                        tr.pk = None
+                        tr.event = self
+                        tr.save()
+                        tr.log_action('eventyay.object.cloned')
                 
                 talk_question_map = {}
                 talk_question_deps = {}
@@ -1504,40 +1553,53 @@ class Event(
                             tq.save(update_fields=['dependency_question'])
                 
                 if hasattr(self, 'cfp') and hasattr(other, 'cfp') and getattr(other.cfp, 'default_type_id', None):
-                    self.cfp.default_type = submission_type_map.get(other.cfp.default_type_id)
-                    self.cfp.save(update_fields=['default_type'])
-                    
-                for ac in other.submitter_access_codes.all():
-                    ac.pk = None
-                    ac.event = self
-                    if ac.track_id:
-                        ac.track = track_map.get(ac.track_id)
-                    if ac.submission_type_id:
-                        ac.submission_type = submission_type_map.get(ac.submission_type_id)
-                    ac.save()
-                    ac.log_action('eventyay.object.cloned')
+                    with scope(event=self):
+                        self.cfp.default_type = submission_type_map.get(other.cfp.default_type_id)
+                        self.cfp.save(update_fields=['default_type'])
+
+                with scope(event=other):
+                    source_access_codes = list(other.submitter_access_codes.all())
+                for ac in source_access_codes:
+                    with scope(event=self):
+                        ac.pk = None
+                        ac.event = self
+                        if ac.track_id:
+                            ac.track = track_map.get(ac.track_id)
+                        if ac.submission_type_id:
+                            ac.submission_type = submission_type_map.get(ac.submission_type_id)
+                        ac.save()
+                        ac.log_action('eventyay.object.cloned')
 
             if clone_review_settings:
                 from eventyay.base.models import ReviewPhase, ReviewScoreCategory, ReviewScore
 
-                self.review_phases.all().delete()
-                for rp in other.review_phases.all():
-                    rp.pk = None
-                    rp.event = self
-                    rp.save()
-                    rp.log_action('eventyay.object.cloned')
+                with scope(event=self):
+                    self.review_phases.all().delete()
+                with scope(event=other):
+                    source_review_phases = list(other.review_phases.all())
+                for rp in source_review_phases:
+                    with scope(event=self):
+                        rp.pk = None
+                        rp.event = self
+                        rp.save()
+                        rp.log_action('eventyay.object.cloned')
 
-                self.score_categories.all().delete()
-                for sc in other.score_categories.prefetch_related('scores'):
-                    scores = list(sc.scores.all())
-                    sc.pk = None
-                    sc.event = self
-                    sc.save()
-                    sc.log_action('eventyay.object.cloned')
-                    for score in scores:
-                        score.pk = None
-                        score.category = sc
-                        score.save()
+                with scope(event=self):
+                    self.score_categories.all().delete()
+                with scope(event=other):
+                    source_score_categories = list(other.score_categories.prefetch_related('scores'))
+                for sc in source_score_categories:
+                    with scope(event=other):
+                        scores = list(sc.scores.all())
+                    with scope(event=self):
+                        sc.pk = None
+                        sc.event = self
+                        sc.save()
+                        sc.log_action('eventyay.object.cloned')
+                        for score in scores:
+                            score.pk = None
+                            score.category = sc
+                            score.save()
         
         event_copy_data.send(
             sender=self,
@@ -2184,6 +2246,61 @@ class Event(
     def private_testmode_talks_enabled(self):
         return self.private_testmode and self.settings.get('private_testmode_talks', False, as_type=bool)
 
+    def send_orga_mail(self, text, stats=False, **kwargs):
+        from eventyay.base.models import QueuedMail
+
+        class SafeDict(dict):
+            def __missing__(self, key):
+                return '{' + key + '}'
+
+        context = {
+            'event_dashboard': self.orga_urls.base.full() if hasattr(self, 'orga_urls') else '',
+            'event_review': self.orga_urls.reviews.full() if hasattr(self, 'orga_urls') else '',
+            'event_schedule': self.orga_urls.schedule.full() if hasattr(self, 'orga_urls') else '',
+            'event_submissions': self.orga_urls.submissions.full() if hasattr(self, 'orga_urls') else '',
+            'event_team': self.orga_urls.team_settings.full() if hasattr(self, 'orga_urls') else '',
+        }
+        with scope(event=self):
+            context['submission_count'] = self.submissions.all().count() if hasattr(self, 'submissions') else 0
+            if stats:
+                context.update(
+                    {
+                        'talk_count': (
+                            self.current_schedule.talks.filter(is_visible=True).count()
+                            if self.current_schedule
+                            else 0
+                        ),
+                        'review_count': self.reviews.count() if hasattr(self, 'reviews') else 0,
+                        'schedule_count': (
+                            max(0, self.schedules.count() - 1)
+                            if hasattr(self, 'schedules')
+                            else 0
+                        ),
+                        'mail_count': (
+                            self.queued_mails.filter(sent__isnull=False).count()
+                            if hasattr(self, 'queued_mails')
+                            else 0
+                        ),
+                    }
+                )
+        if kwargs:
+            context.update(kwargs)
+
+        with override(self.locale):
+            try:
+                formatted_text = str(text).format_map(SafeDict(context))
+            except (ValueError, KeyError, IndexError):
+                formatted_text = str(text)
+
+            mail = QueuedMail(
+                event=self,
+                subject=_('News from your content system'),
+                text=formatted_text,
+                to=self.email,
+                locale=self.locale,
+            )
+            mail.send()
+
     def _component_presale_status(self, *, published: bool, private_testmode_enabled: bool, testmode: bool):
         if private_testmode_enabled:
             text = _('live (private test mode)') if self.live else _('in private test mode')
@@ -2434,10 +2551,11 @@ class Event(
         from eventyay.base.models.feedback import Feedback
         from eventyay.base.models.log import ActivityLog, LogEntry
         from eventyay.base.models.mail import QueuedMail
-        from eventyay.base.models.question import Answer, AnswerOption
+        from eventyay.base.models.question import Answer, AnswerOption, TalkQuestion
         from eventyay.base.models.resource import Resource
         from eventyay.base.models.slot import TalkSlot
         from eventyay.base.models.storage_model import StoredFile
+        from eventyay.base.models.submission import Submission
         from eventyay.base.models.systemlog import SystemLog
 
         self.cartposition_set.filter(addon_to__isnull=False).delete()
@@ -2473,8 +2591,11 @@ class Event(
         self.vouchers.all().delete()
         self.products.all().delete()
         self.subevents.all().delete()
-        self.talkquestions.all().delete()
-        self.submissions.all().delete()
+        from django_scopes import scope
+
+        with scope(event=self):
+            TalkQuestion.all_objects.filter(event=self).delete()
+            Submission.all_objects.filter(event=self).delete()
         self.rooms.all().delete()
         self.tracks.all().delete()
         self.tags.all().delete()
@@ -2513,9 +2634,10 @@ class Event(
         from eventyay.base.models.mail import QueuedMail
         from eventyay.base.models.profile import SpeakerProfile
         from eventyay.base.models.feedback import Feedback
-        from eventyay.base.models.question import Answer, AnswerOption
+        from eventyay.base.models.question import Answer, AnswerOption, TalkQuestion
         from eventyay.base.models.resource import Resource
         from eventyay.base.models.slot import TalkSlot
+        from eventyay.base.models.submission import Submission
 
         answers = Answer.objects.filter(question__event=self)
         for answer in answers.only('pk', 'answer_file').iterator():
@@ -2542,8 +2664,11 @@ class Event(
         # Clear unsent (outbox) emails linked to this event
         QueuedMail.objects.filter(event=self, sent__isnull=True).delete()
 
-        self.talkquestions.all().delete()
-        self.submissions.all().delete()
+        from django_scopes import scope
+
+        with scope(event=self):
+            TalkQuestion.all_objects.filter(event=self).delete()
+            Submission.all_objects.filter(event=self).delete()
         self.rooms.all().delete()
         self.tracks.all().delete()
         self.tags.all().delete()

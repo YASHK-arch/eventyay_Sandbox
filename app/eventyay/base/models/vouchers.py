@@ -149,6 +149,14 @@ class Voucher(LoggedModel):
             'organiser. This is applicable for products that require approval.'
         ),
     )
+    all_addons_included = models.BooleanField(
+        default=False,
+        verbose_name=_('Offer all add-on products for free when redeeming this voucher'),
+    )
+    all_bundles_included = models.BooleanField(
+        default=False,
+        verbose_name=_('Include all bundled products without a designated price when redeeming this voucher'),
+    )
     price_mode = models.CharField(
         verbose_name=_('Price mode'),
         max_length=100,
@@ -259,6 +267,13 @@ class Voucher(LoggedModel):
                 ),
                 name='voucher_percent_value_lte_100',
             ),
+            models.CheckConstraint(
+                condition=(
+                    models.Q(budget__isnull=True)
+                    | models.Q(all_addons_included=False, all_bundles_included=False)
+                ),
+                name='voucher_budget_not_with_included_products',
+            ),
         ]
 
     def __str__(self):
@@ -285,6 +300,8 @@ class Voucher(LoggedModel):
                 'value': self.value,
                 'price_mode': self.price_mode,
                 'budget': self.budget,
+                'all_addons_included': self.all_addons_included,
+                'all_bundles_included': self.all_bundles_included,
             }
         )
 
@@ -302,6 +319,16 @@ class Voucher(LoggedModel):
 
         if budget is not None and budget < Decimal('0.00'):
             raise ValidationError({'budget': _('Voucher budget cannot be negative.')})
+
+        if budget is not None and (data.get('all_addons_included') or data.get('all_bundles_included')):
+            raise ValidationError(
+                {
+                    'budget': _(
+                        'A discount budget cannot be combined with free add-on or included bundle products, '
+                        'since those discounts are not tracked against the budget.'
+                    )
+                }
+            )
 
     @staticmethod
     def clean_product_properties(
@@ -764,6 +791,19 @@ class InvoiceVoucher(LoggedModel):
         ),
         default=False,
     )
+    applies_to_platform_fees = models.BooleanField(
+        verbose_name=_('Ticket platform fees'),
+        help_text=_('Waive or discount the platform fee charged on ticket sales.'),
+        default=True,
+    )
+    budget_used = models.DecimalField(
+        verbose_name=_('Budget used'),
+        help_text=_('Total amount already waived or discounted with this voucher.'),
+        decimal_places=2,
+        max_digits=10,
+        default=Decimal('0.00'),
+        validators=[MinValueValidator(Decimal('0.00'))],
+    )
 
     limit_events = models.ManyToManyField(
         'Event',
@@ -827,20 +867,30 @@ class InvoiceVoucher(LoggedModel):
             return 'draft'
         if self.status == self.STATUS_DISABLED:
             return 'disabled'
-        if self.redeemed >= self.max_usages:
+        if self.redeemed >= self.max_usages or self.budget_exhausted():
             return 'used_up'
         if self.valid_until and self.valid_until < now():
             return 'expired'
         return 'active'
 
+    def remaining_budget(self) -> Decimal | None:
+        """Return the amount that can still be waived, or ``None`` when there is no budget limit."""
+        if self.budget is None:
+            return None
+        return max(self.budget - self.budget_used, Decimal('0.00'))
+
+    def budget_exhausted(self) -> bool:
+        return self.budget is not None and self.budget_used >= self.budget
+
+    def is_usable(self) -> bool:
+        """Return whether discounts already granted by this voucher may still be applied."""
+        if self.status != self.STATUS_ACTIVE or self.budget_exhausted():
+            return False
+        return not (self.valid_until and self.valid_until < now())
+
     def is_active(self) -> bool:
-        if self.status != self.STATUS_ACTIVE:
-            return False
-        if self.redeemed >= self.max_usages:
-            return False
-        if self.valid_until and self.valid_until < now():
-            return False
-        return True
+        """Return whether the voucher can be redeemed again."""
+        return self.is_usable() and self.redeemed < self.max_usages
 
     def get_effect_display(self) -> str:
         """Return human-readable platform-fee effect text."""
@@ -848,12 +898,12 @@ class InvoiceVoucher(LoggedModel):
             return str(_('No effect'))
         if self.price_mode == PriceModeChoices.PERCENT:
             if self.value == Decimal('100.00'):
-                return str(_('Waives 100% of platform fees'))
-            return str(_('%(pct)s%% platform fee discount') % {'pct': self.value})
+                return str(_('Waives 100%'))
+            return str(_('%(pct)s%% discount') % {'pct': self.value})
         if self.price_mode == PriceModeChoices.SUBTRACT:
             return str(_('Fixed credit %(amount)s') % {'amount': f'{self.value:.2f}'})
         if self.price_mode == PriceModeChoices.SET:
-            return str(_('Set platform fee to %(amount)s') % {'amount': f'{self.value:.2f}'})
+            return str(_('Set price to %(amount)s') % {'amount': f'{self.value:.2f}'})
         return str(_('No effect'))
 
     def get_scope_display(self) -> str:
@@ -883,7 +933,7 @@ class InvoiceVoucher(LoggedModel):
         """Return human-readable budget usage text."""
         if self.budget is None:
             return str(_('No budget limit'))
-        return f'0.00 / {self.budget:.2f}'
+        return f'{self.budget_used:.2f} / {self.budget:.2f}'
 
     def allow_delete(self) -> bool:
         return self.redeemed == 0 and self.status == self.STATUS_DRAFT

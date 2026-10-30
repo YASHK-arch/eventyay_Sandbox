@@ -23,7 +23,6 @@ import features from 'features'
 import config from 'config'
 import { hasOrganizerTraits } from 'lib/traitGrants'
 import { loadThemeConfig } from 'theme'
-import 'webrtc-adapter'
 
 function ensureWebsiteFontsLoaded() {
   if (document.head.querySelector('link[data-eventyay-fonts]')) {
@@ -140,7 +139,7 @@ async function init({ token, inviteToken }) {
     console.error('[VUE] ', info, vm, error)
   }
 
-  store.commit('setUserLocale', i18n.resolvedLanguage)
+  store.commit('setUserLocale', i18n.language || i18n.resolvedLanguage || config.defaultLocale || config.locale || 'en')
   store.dispatch('updateUserTimezone', localStorage.userTimezone || moment.tz.guess())
 
   if (activeToken) {

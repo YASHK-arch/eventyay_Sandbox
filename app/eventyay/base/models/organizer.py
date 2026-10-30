@@ -7,7 +7,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from django.conf import settings
 from django.core.exceptions import PermissionDenied
-from django.core.validators import MinLengthValidator, RegexValidator
+from django.core.validators import RegexValidator
 from django.db import models, transaction
 from django.db.models import Exists, OuterRef, Q
 from django.db.models.signals import m2m_changed
@@ -39,6 +39,17 @@ from .auth import User
 
 
 logger = logging.getLogger(__name__)
+
+TEAM_INVITE_SUBJECT = _('You have been invited to an organizer team')
+TEAM_INVITE_TEXT = _(
+    """Hi!
+You have been invited to the {name} event organizer team - Please click here to accept:
+
+{invitation_link}
+
+See you there,
+The {organizer} team"""
+)
 
 
 class TeamPermissionError(PermissionDenied):
@@ -126,11 +137,8 @@ class Organizer(LoggedModel, TimestampedModel, RulesModelMixin, models.Model, me
             'once. This is being used in URLs to refer to your organizer accounts and your events.'
         ),
         validators=[
-            MinLengthValidator(
-                limit_value=2,
-            ),
             RegexValidator(
-                regex='^[a-zA-Z0-9][a-zA-Z0-9.-]*[a-zA-Z0-9]$',
+                regex=r'^[a-zA-Z0-9](?:[a-zA-Z0-9.-]*[a-zA-Z0-9])?\Z',
                 message=_('The slug may only contain letters, numbers, dots and dashes.'),
             ),
             OrganizerSlugBanlistValidator(),
@@ -693,20 +701,12 @@ class TeamInvite(models.Model):
         from eventyay.base.models.mail import QueuedMail
 
         invitation_link = self.invitation_url
-        invitation_text = _(
-            """Hi!
-You have been invited to the {name} event organizer team - Please click here to accept:
-
-{invitation_link}
-
-See you there,
-The {organizer} team"""
-        ).format(
+        invitation_text = str(TEAM_INVITE_TEXT).format(
             name=str(self.team.name),
             invitation_link=invitation_link,
             organizer=str(self.team.organizer.name),
         )
-        invitation_subject = _('You have been invited to an organizer team')
+        invitation_subject = TEAM_INVITE_SUBJECT
 
         mail = QueuedMail.objects.create(
             to=self.email,

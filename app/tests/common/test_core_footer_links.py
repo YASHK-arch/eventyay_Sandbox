@@ -73,7 +73,7 @@ def test_global_settings_form_footer_defaults():
         for key in ['events', 'terms', 'privacy', 'pricing', 'documentation', 'support']:
             assert f'footer_link_{key}_enabled' in form.fields
             assert f'footer_link_{key}_url' in form.fields
-        for page_key in ['terms', 'privacy', 'pricing', 'support']:
+        for page_key in ['terms', 'privacy', 'support']:
             field_name = f'footer_page_{page_key}_text'
             assert field_name in form.fields
             assert isinstance(form.fields[field_name], I18nRichTextFormField)
@@ -246,6 +246,22 @@ def test_system_page_view_custom_content():
             page = view.get_page()
             assert page.title == 'Privacy Policy'
             assert str(page.text) == '# Custom Privacy Content'
+
+
+def test_system_page_view_default_fallback_content():
+    # Verify SystemPageView fallback content does not duplicate the page title
+    view = SystemPageView()
+    view.slug = 'terms'
+
+    with patch('eventyay.control.views.pages.Page.objects.get', side_effect=Page.DoesNotExist):
+        with patch('eventyay.control.views.pages.GlobalSettingsObject') as mock_gso:
+            mock_settings = _make_mock_settings()
+            mock_gso.return_value.settings = mock_settings
+            page = view.get_page()
+            assert page.title == 'Terms of Service'
+            assert 'Content for this page has not been configured yet.' in str(page.text)
+            assert 'Terms of Service' not in str(page.text)
+            assert '<h1' not in str(page.text)
 
 
 def test_core_footer_template_structure():

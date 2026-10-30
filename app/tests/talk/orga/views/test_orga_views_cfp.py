@@ -1,14 +1,29 @@
 import datetime as dt
+import json
+import re
 from zoneinfo import ZoneInfo
 
 import pytest
 from django.core import mail as djmail
 from django_scopes import scope
 
-from eventyay.base.models import Event
+from eventyay.base.models import Answer, Event, Submission, SubmissionType, Track
 from eventyay.base.models import QueuedMail
 from eventyay.base.models import TalkQuestion as Question
 from eventyay.base.models.question import TalkQuestionRequired as QuestionRequired
+
+_FORM_OPEN = re.compile(r"<form(?:\s|>)", re.I)
+_FORM_CLOSE = re.compile(r"</form\s*>", re.I)
+
+
+def _max_form_nesting(html: str) -> int:
+    events = [(match.start(), 1) for match in _FORM_OPEN.finditer(html)]
+    events += [(match.start(), -1) for match in _FORM_CLOSE.finditer(html)]
+    depth = max_depth = 0
+    for _, delta in sorted(events):
+        depth += delta
+        max_depth = max(max_depth, depth)
+    return max_depth
 
 
 @pytest.mark.django_db
@@ -105,12 +120,25 @@ def test_make_submission_type_default(
     with scope(event=submission_type.event):
         assert default_submission_type.event.submission_types.count() == 2
         assert submission_type.event.cfp.default_type == default_submission_type
-    response = orga_client.get(submission_type.urls.default, follow=True)
+    response = orga_client.post(submission_type.urls.default, follow=True)
     assert response.status_code == 200
     with scope(event=submission_type.event):
         assert default_submission_type.event.submission_types.count() == 2
         submission_type.event.cfp.refresh_from_db()
         assert submission_type.event.cfp.default_type == submission_type
+
+
+@pytest.mark.django_db
+def test_make_submission_type_default_rejects_get(
+    orga_client, submission_type, default_submission_type
+):
+    with scope(event=submission_type.event):
+        assert submission_type.event.cfp.default_type == default_submission_type
+    response = orga_client.get(submission_type.urls.default)
+    assert response.status_code == 405
+    with scope(event=submission_type.event):
+        submission_type.event.cfp.refresh_from_db()
+        assert submission_type.event.cfp.default_type == default_submission_type
 
 
 @pytest.mark.django_db
@@ -585,7 +613,7 @@ def test_can_remind_answered_submission_question(
 def test_can_hide_question(orga_client, question):
     assert question.active
 
-    response = orga_client.get(question.urls.toggle, follow=True)
+    response = orga_client.post(question.urls.toggle, follow=True)
     with scope(event=question.event):
         question = Question.all_objects.get(pk=question.pk)
 
@@ -594,10 +622,43 @@ def test_can_hide_question(orga_client, question):
 
 
 @pytest.mark.django_db
+def test_hide_question_rejects_get(orga_client, question):
+    assert question.active
+    response = orga_client.get(question.urls.toggle)
+    with scope(event=question.event):
+        question = Question.all_objects.get(pk=question.pk)
+    assert response.status_code == 405
+    assert question.active
+
+
+@pytest.mark.django_db
+def test_can_hide_question_via_json(orga_client, question):
+    assert question.active
+    response = orga_client.post(
+        question.urls.toggle,
+        data=json.dumps({"field": "active", "value": False}),
+        content_type="application/json",
+    )
+    with scope(event=question.event):
+        question = Question.all_objects.get(pk=question.pk)
+    assert response.status_code == 200
+    assert not question.active
+
+
+@pytest.mark.django_db
+def test_question_edit_toggle_form_is_not_nested(orga_client, question):
+    response = orga_client.get(question.urls.edit)
+    assert response.status_code == 200
+    html = response.content.decode()
+    assert question.urls.toggle in html
+    assert _max_form_nesting(html) <= 1
+
+
+@pytest.mark.django_db
 def test_can_activate_inactive_question(orga_client, inactive_question):
     assert not inactive_question.active
 
-    response = orga_client.get(inactive_question.urls.toggle, follow=True)
+    response = orga_client.post(inactive_question.urls.toggle, follow=True)
     inactive_question.refresh_from_db()
 
     assert response.status_code == 200
@@ -800,3 +861,279 @@ def test_can_send_special_access_code(orga_client, access_code, track):
     djmail.outbox = []
     response = orga_client.get(access_code.urls.send, follow=True)
     assert response.status_code == 200
+
+@pytest.mark.django_db
+@pytest.mark.parametrize("restriction", ("matching", "other", "unrestricted"))
+@pytest.mark.parametrize("target", ("submission", "speaker"))
+@pytest.mark.parametrize("answered", (False, True))
+def test_question_reminders_respect_track_restrictions(
+    orga_client, event, question, submission, speaker, track, restriction, answered, target
+):
+    with scope(event=event):
+        question.target = target
+        question.save(update_fields=["target"])
+        submission.track = track
+        submission.save(update_fields=["track"])
+        if restriction == "matching":
+            question.tracks.add(track)
+        elif restriction == "other":
+            question.tracks.add(Track.objects.create(event=event, name="Other track"))
+        if answered:
+            Answer.objects.create(
+                question=question, answer="Answered",
+                submission=submission if target == "submission" else None,
+                person=speaker if target == "speaker" else None,
+            )
+        existing_ids = list(QueuedMail.objects.values_list("pk", flat=True))
+    response = orga_client.post(
+        event.cfp.urls.remind_questions,
+        {"role": "", "track": track.pk, "questions": [question.pk]},
+    )
+    assert response.status_code == 302
+    with scope(event=event):
+        reminders = QueuedMail.objects.exclude(pk__in=existing_ids)
+        assert reminders.count() == int(restriction != "other" and not answered)
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize("target", ("submission", "speaker"))
+@pytest.mark.parametrize("answered", (False, True))
+def test_question_reminders_include_trackless_submissions(
+    orga_client, event, question, submission, speaker, track, target, answered
+):
+    """Trackless submissions remain eligible for restricted, unanswered questions."""
+    with scope(event=event):
+        submission.track = None
+        submission.save(update_fields=["track"])
+        question.target = target
+        question.save(update_fields=["target"])
+        question.tracks.add(track)
+        if answered:
+            Answer.objects.create(
+                question=question, answer="Answered",
+                submission=submission if target == "submission" else None,
+                person=speaker if target == "speaker" else None,
+            )
+        existing_ids = list(QueuedMail.objects.values_list("pk", flat=True))
+    response = orga_client.post(
+        event.cfp.urls.remind_questions,
+        {"role": "", "questions": [question.pk]},
+    )
+    assert response.status_code == 302
+    with scope(event=event):
+        reminders = QueuedMail.objects.exclude(pk__in=existing_ids)
+        assert reminders.count() == int(not answered)
+
+
+@pytest.mark.django_db
+def test_orga_cfp_forms_shows_session_videos_as_organizer_only(orga_client, event):
+    response = orga_client.get(event.cfp.urls.questions, follow=True)
+    assert response.status_code == 200
+    content = response.text
+    assert "cfp-organizer-only-label" in content
+    assert "Session videos" in content
+    assert "Organizer only" in content
+    assert "This field can only be edited by organizers."
+    assert (
+        "This field can only be edited by organizers. "
+        "It is not displayed on the proposal form."
+    ) in content
+
+
+@pytest.mark.django_db
+def test_track_list_sorting(orga_client, event):
+    url = event.cfp.urls.tracks
+    with scope(event=event):
+        t1 = Track.objects.create(event=event, name="Beta Track", color="#111111", position=2)
+        t2 = Track.objects.create(event=event, name="Alpha Track", color="#ffffff", position=1)
+        t3 = Track.objects.create(event=event, name="Gamma Track", color="#000000", position=3)
+        sub_type = event.submission_types.first()
+        Submission.objects.create(event=event, title="Sub 1", track=t3, submission_type=sub_type)
+        Submission.objects.create(event=event, title="Sub 2", track=t3, submission_type=sub_type)
+        Submission.objects.create(event=event, title="Sub 3", track=t1, submission_type=sub_type)
+        Submission.all_objects.create(
+            event=event, title="Sub Draft", track=t2, submission_type=sub_type, state="draft"
+        )
+        Submission.all_objects.create(
+            event=event, title="Sub Deleted", track=t2, submission_type=sub_type, state="deleted"
+        )
+
+    # Default sort (no ?sort) preserves position order and enables reordering
+    response = orga_client.get(url)
+    assert response.status_code == 200
+    assert response.context["can_reorder"] is True
+    assert "dragsort-button" in response.text
+    pks = [t.pk for t in response.context["track_list"]]
+    assert pks == [t2.pk, t1.pk, t3.pk]
+
+    # Sort by name ascending (a-z) disables reordering and shows caret-up
+    response = orga_client.get(f"{url}?sort=name")
+    assert response.status_code == 200
+    assert response.context["can_reorder"] is False
+    assert "dragsort-button" not in response.text
+    assert "Reset to manual order" in response.text
+    pks = [t.pk for t in response.context["track_list"]]
+    assert pks == [t2.pk, t1.pk, t3.pk]
+    assert "fa-caret-up" in response.text
+    assert "text-primary" in response.text
+
+    # Reordering via POST while field sort is active must be rejected
+    reorder_res = orga_client.post(f"{url}?sort=name", {"order": f"{t1.pk},{t2.pk},{t3.pk}"})
+    assert reorder_res.status_code == 400
+
+    # Sort by name descending (z-a)
+    response = orga_client.get(f"{url}?sort=-name")
+    assert response.status_code == 200
+    assert response.context["can_reorder"] is False
+    assert "dragsort-button" not in response.text
+    pks = [t.pk for t in response.context["track_list"]]
+    assert pks == [t3.pk, t1.pk, t2.pk]
+    assert "fa-caret-down" in response.text
+
+    # Sort by color ascending
+    response = orga_client.get(f"{url}?sort=color")
+    assert response.status_code == 200
+    assert response.context["can_reorder"] is False
+    pks = [t.pk for t in response.context["track_list"]]
+    assert pks == [t3.pk, t1.pk, t2.pk]
+    assert "fa-caret-up" in response.text
+    assert "text-primary" in response.text
+
+    # Sort by color descending
+    response = orga_client.get(f"{url}?sort=-color")
+    assert response.status_code == 200
+    assert response.context["can_reorder"] is False
+    pks = [t.pk for t in response.context["track_list"]]
+    assert pks == [t2.pk, t1.pk, t3.pk]
+    assert "fa-caret-down" in response.text
+
+    # Sort by proposals descending (high to low)
+    response = orga_client.get(f"{url}?sort=-proposals")
+    assert response.status_code == 200
+    assert response.context["can_reorder"] is False
+    pks = [t.pk for t in response.context["track_list"]]
+    assert pks == [t3.pk, t1.pk, t2.pk]
+
+    # Sort by proposals ascending (low to high)
+    response = orga_client.get(f"{url}?sort=proposals")
+    assert response.status_code == 200
+    assert response.context["can_reorder"] is False
+    pks = [t.pk for t in response.context["track_list"]]
+    assert pks == [t2.pk, t1.pk, t3.pk]
+
+
+@pytest.mark.django_db
+def test_track_list_sorting_multilingual(orga_client, orga_user, event):
+    url = event.cfp.urls.tracks
+    with scope(event=event):
+        event.locales = ["en", "de"]
+        event.settings.locales = ["en", "de"]
+        event.save()
+        # t1 is Beta in English, Alpha in German
+        t1 = Track.objects.create(
+            event=event, name={"en": "Beta Track", "de": "Alpha Schiene"}, color="#111111", position=1
+        )
+        # t2 is Alpha in English, Beta in German
+        t2 = Track.objects.create(
+            event=event, name={"en": "Alpha Track", "de": "Beta Schiene"}, color="#222222", position=2
+        )
+
+    # In English: "Alpha Track" (t2) < "Beta Track" (t1)
+    orga_user.locale = "en"
+    orga_user.save()
+    response = orga_client.get(f"{url}?sort=name")
+    assert response.status_code == 200
+    pks = [t.pk for t in response.context["track_list"]]
+    assert pks == [t2.pk, t1.pk]
+
+    # In German: "Alpha Schiene" (t1) < "Beta Schiene" (t2)
+    orga_user.locale = "de"
+    orga_user.save()
+    response = orga_client.get(f"{url}?sort=name")
+    assert response.status_code == 200
+    pks = [t.pk for t in response.context["track_list"]]
+    assert pks == [t1.pk, t2.pk]
+
+
+@pytest.mark.django_db
+def test_submission_type_list_sorting(orga_client, event):
+    url = event.cfp.urls.types
+    with scope(event=event):
+        default_type = event.cfp.default_type
+        default_type.position = 0
+        default_type.save()
+        st1 = SubmissionType.objects.create(event=event, name="Workshop", default_duration=120, position=2)
+        st2 = SubmissionType.objects.create(event=event, name="Keynote", default_duration=60, position=1)
+        st3 = SubmissionType.objects.create(event=event, name="Lightning Talk", default_duration=15, position=3)
+        # Create proposals
+        Submission.objects.create(event=event, title="Sub A", submission_type=st3)
+        Submission.objects.create(event=event, title="Sub B", submission_type=st3)
+        Submission.objects.create(event=event, title="Sub C", submission_type=st1)
+        Submission.all_objects.create(
+            event=event, title="Sub Draft 2", submission_type=st2, state="draft"
+        )
+        Submission.all_objects.create(
+            event=event, title="Sub Deleted 2", submission_type=st2, state="deleted"
+        )
+
+    # Default sort (no ?sort) preserves position order and enables reordering
+    response = orga_client.get(url)
+    assert response.status_code == 200
+    assert response.context["can_reorder"] is True
+    assert "dragsort-button" in response.text
+    pks = [st.pk for st in response.context["submissiontype_list"]]
+    assert pks == [default_type.pk, st2.pk, st1.pk, st3.pk]
+
+    # Sort by name ascending (a-z) disables reordering and shows caret-up
+    response = orga_client.get(f"{url}?sort=name")
+    assert response.status_code == 200
+    assert response.context["can_reorder"] is False
+    assert "dragsort-button" not in response.text
+    assert "Reset to manual order" in response.text
+    names = [st.name for st in response.context["submissiontype_list"]]
+    assert names == sorted(names, key=str)
+    assert "fa-caret-up" in response.text
+    assert "text-primary" in response.text
+
+    # Reordering via POST while field sort is active must be rejected
+    reorder_res = orga_client.post(f"{url}?sort=name", {"order": f"{st1.pk},{st2.pk},{st3.pk}"})
+    assert reorder_res.status_code == 400
+
+    # Sort by name descending (z-a)
+    response = orga_client.get(f"{url}?sort=-name")
+    assert response.status_code == 200
+    assert response.context["can_reorder"] is False
+    assert "dragsort-button" not in response.text
+    names = [st.name for st in response.context["submissiontype_list"]]
+    assert names == sorted(names, key=str, reverse=True)
+    assert "fa-caret-down" in response.text
+
+    # Sort by default_duration descending (high to low)
+    response = orga_client.get(f"{url}?sort=-default_duration")
+    assert response.status_code == 200
+    assert response.context["can_reorder"] is False
+    durations = [st.default_duration for st in response.context["submissiontype_list"]]
+    assert durations == sorted(durations, reverse=True)
+
+    # Sort by default_duration ascending (low to high)
+    response = orga_client.get(f"{url}?sort=default_duration")
+    assert response.status_code == 200
+    assert response.context["can_reorder"] is False
+    durations = [st.default_duration for st in response.context["submissiontype_list"]]
+    assert durations == sorted(durations)
+
+    # Sort by proposals descending (high to low)
+    response = orga_client.get(f"{url}?sort=-proposals")
+    assert response.status_code == 200
+    assert response.context["can_reorder"] is False
+    proposals = [st.proposals for st in response.context["submissiontype_list"]]
+    assert proposals == sorted(proposals, reverse=True)
+
+    # Sort by proposals ascending (low to high)
+    response = orga_client.get(f"{url}?sort=proposals")
+    assert response.status_code == 200
+    assert response.context["can_reorder"] is False
+    proposals = [st.proposals for st in response.context["submissiontype_list"]]
+    assert proposals == sorted(proposals)
+
+

@@ -207,9 +207,12 @@
                 {% blocktranslate with link=link trimmed %}
                     You’re using eventyay as a superuser. This is not recommended.
                 {% endblocktranslate %}
-                <a href="{% url "orga:user.subuser" %}?next={{ request.path|urlencode }}">
-                    {% translate "Please click here to switch to an administrator account." %}
-                </a>
+                <form method="post" action="{% url 'orga:user.subuser' %}?next={{ request.path|urlencode }}" class="d-inline">
+                    {% csrf_token %}
+                    <button type="submit" class="btn btn-link p-0 align-baseline">
+                        {% translate "Please click here to switch to an administrator account." %}
+                    </button>
+                </form>
             </div>
         {% endif %}
         <div id="page-wrapper">
@@ -305,11 +308,9 @@
                                     <a href="{{ request.event.orga_urls.room_settings }}" class="nav-link nav-link-second-level{% if 'schedule.rooms.' in url_name %} active{% endif %}">
                                         <span>{% translate "Rooms" %}</span>
                                     </a>
-                                    {% if request.event|get_feature_flag:"use_tracks" %}
-                                        <a href="{{ request.event.cfp.urls.tracks }}" class="nav-link nav-link-second-level{% if 'cfp.track' in url_name %} active{% endif %}">
+                                    <a href="{{ request.event.cfp.urls.tracks }}" class="nav-link nav-link-second-level{% if 'cfp.track' in url_name %} active{% endif %}">
                                             <span>{% translate "Tracks" %}</span>
                                         </a>
-                                    {% endif %}
                                     <a href="{{ request.event.cfp.urls.types }}" class="nav-link nav-link-second-level{% if 'cfp.type' in url_name %} active{% endif %}">
                                         <span>{% translate "Session Types" %}</span>
                                     </a>
@@ -524,6 +525,7 @@
                     {% block content %}
                     {% endblock content %}
                 </main>
+                {% block footer %}
                 <footer>
                     {% include "common/powered_by.html" %}
                     {% if development_mode %}
@@ -541,6 +543,7 @@
                         {% endif %}
                     </ul>
                 </footer>
+                {% endblock footer %}
             </div>
         </div>
         {% include "common/includes/modals.html" %}

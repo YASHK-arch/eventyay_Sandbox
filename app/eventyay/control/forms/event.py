@@ -85,6 +85,7 @@ from eventyay.control.forms import (
 )
 from eventyay.control.forms.widgets import Select2
 from eventyay.helpers.countries import CachedCountries
+from eventyay.helpers.timezone import format_timezone_name
 from eventyay.multidomain.urlreverse import build_absolute_uri
 from eventyay.orga.forms.widgets import HeaderSelect
 from eventyay.plugins.banktransfer.payment import BankTransfer
@@ -202,8 +203,8 @@ class EventWizardBasicsForm(I18nModelForm):
                             'for an automatic suggestion.'),
     }
     timezone = forms.ChoiceField(
-        choices=((a, a) for a in common_timezones),
-        label=_('Event timezone'),
+        choices=((a, format_timezone_name(a)) for a in common_timezones),
+        label=_('Region'),
     )
     locale = forms.ChoiceField(
         choices=settings.LANGUAGES,
@@ -805,8 +806,6 @@ class GeneralEventSettingsForm(EventSettingsForm):
         'event_list_type',
         'event_list_available_only',
         'event_info_text',
-        'banner_text',
-        'banner_text_bottom',
         'allow_modifications',
         'last_order_modification_date',
         'allow_modifications_after_checkin',

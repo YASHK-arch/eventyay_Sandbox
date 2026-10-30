@@ -41,6 +41,7 @@ from eventyay.common.views.mixins import (
     EventPermissionRequired,
     OrderActionMixin,
     PermissionRequired,
+    Sortable,
 )
 from eventyay.orga.forms.schedule import ScheduleReleaseForm
 from eventyay.schedule.forms import QuickScheduleForm, RoomForm
@@ -195,16 +196,13 @@ class ScheduleToggleView(EventPermissionRequired, View):
         event.save(update_fields=['feature_flags'])
         log_event('video', 'video.feature_flag', OUTCOME_SUCCESS, event_id=event.pk, flag_name='show_schedule')
 
-    def get(self, request, *args, **kwargs):
-        return redirect(self.request.event.orga_urls.schedule)
-
     def post(self, request, *args, **kwargs):
-        is_public = not self.request.event.get_feature_flag('show_schedule')
-        self._set_schedule_public(self.request.event, is_public)
+        is_public = not request.event.get_feature_flag('show_schedule')
+        self._set_schedule_public(request.event, is_public)
         if is_public:
-            messages.success(self.request, _('The schedule is now public.'))
+            messages.success(request, _('The schedule is now public.'))
         else:
-            messages.success(self.request, _('The public schedule has been unpublished.'))
+            messages.success(request, _('The public schedule has been unpublished.'))
         # Trigger tickets to hidden/unhidden schedule menu
         try:
             from eventyay.orga.tasks import trigger_public_schedule
@@ -212,9 +210,9 @@ class ScheduleToggleView(EventPermissionRequired, View):
             trigger_public_schedule.apply_async(
                 kwargs={
                     'is_show_schedule': is_public,
-                    'event_slug': self.request.event.slug,
-                    'organiser_slug': self.request.event.organizer.slug,
-                    'user_email': self.request.user.email,
+                    'event_slug': request.event.slug,
+                    'organiser_slug': request.event.organizer.slug,
+                    'user_email': request.user.email,
                 },
                 ignore_result=True,
             )
@@ -224,7 +222,7 @@ class ScheduleToggleView(EventPermissionRequired, View):
         except Exception:
             log_event('talk', 'connection.schedule_public', OUTCOME_FAILURE, error_code='enqueue_failed', event_id=getattr(self.request.event, 'pk', None), backend='tickets_api')
             logger.exception('Unexpected error enqueueing schedule visibility sync')
-        return redirect(self.request.event.orga_urls.schedule)
+        return redirect(request.event.orga_urls.schedule)
 
 
 class ScheduleResendMailsView(EventPermissionRequired, View):
@@ -249,9 +247,10 @@ class ScheduleResendMailsView(EventPermissionRequired, View):
 
 
 def serialize_break(slot):
+    title = slot.description.data if hasattr(slot.description, 'data') else (str(slot.description) if slot.description else '')
     return {
         'id': slot.pk,
-        'title': slot.description.data if slot.description else '',
+        'title': title,
         'description': '',
         'room': slot.room.pk if slot.room else None,
         'start': slot.start.isoformat() if slot.start else None,
@@ -273,6 +272,7 @@ def serialize_slot(slot, warnings=None):
             'title': str(slot.submission.title),
             'speakers': speakers_list,
             'submission_type': str(slot.submission.submission_type.name),
+            'session_type': str(slot.submission.submission_type.name),
             'track': (
                 {
                     'id': slot.submission.track.pk,
@@ -439,7 +439,13 @@ class TalkUpdate(PermissionRequired, View):
     def get_object(self):
         qs = self.request.event.wip_schedule.talks.filter(pk=self.kwargs.get('pk'))
         qs = apply_track_limit_to_slots(qs, self.request.event, self.request.user)
-        return qs.first()
+        return qs.select_related(
+            'submission',
+            'submission__submission_type',
+            'submission__track',
+            'room',
+            'schedule',
+        ).prefetch_related('submission__speakers').first()
 
     @csrf_exempt
     def dispatch(self, request, *args, **kwargs):
@@ -479,12 +485,17 @@ class TalkUpdate(PermissionRequired, View):
                     talk.save(update_fields=['start', 'end', 'room', 'description', 'updated'])
             except Room.DoesNotExist:
                 return JsonResponse({'error': 'Room not found'})
-            talk.refresh_from_db()
+            for prop in ('local_start', 'local_end', 'real_end', 'warnings', 'warnings_extended', 'as_availability'):
+                talk.__dict__.pop(prop, None)
+            talk.refresh_from_db(fields=['updated'])
         else:
             talk.start = None
             talk.end = None
             talk.room = None
             talk.save(update_fields=['start', 'end', 'room', 'updated'])
+            for prop in ('local_start', 'local_end', 'real_end', 'warnings', 'warnings_extended', 'as_availability'):
+                talk.__dict__.pop(prop, None)
+            talk.refresh_from_db(fields=['updated'])
 
         with_speakers = self.request.event.cfp.request_availabilities
         warnings = talk.schedule.get_talk_warnings(talk, with_speakers=with_speakers)
@@ -525,14 +536,21 @@ class QuickScheduleView(PermissionRequired, UpdateView):
         return self.request.path
 
 
-class RoomView(OrderActionMixin, OrgaCRUDView):
+class RoomView(Sortable, OrderActionMixin, OrgaCRUDView):
     model = Room
     form_class = RoomForm
     template_namespace = 'orga/schedule'
+    sortable_fields = ('name', 'capacity')
+    secondary_sort = {
+        '': ('position',),
+        'name': ('position',),
+        'capacity': ('position',),
+    }
 
     def get_queryset(self):
         # Filter out soft-deleted rooms to sync with video component
-        return self.request.event.rooms.filter(deleted=False).with_has_linked_sessions()
+        qs = self.request.event.rooms.filter(deleted=False).with_has_linked_sessions()
+        return self.sort_queryset(qs)
 
     def get_permission_required(self):
         permission_map = {'list': 'orga_list', 'detail': 'orga_detail'}
@@ -614,6 +632,8 @@ class RoomView(OrderActionMixin, OrgaCRUDView):
         return ctx
 
     def order_handler(self, request, *args, **kwargs):
+        if not self.can_reorder():
+            return HttpResponseBadRequest('Reordering is only allowed in default position order.')
         order = request.POST.get('order')
         if order:
             pks = [pk.strip() for pk in order.split(',') if pk.strip()]

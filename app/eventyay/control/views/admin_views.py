@@ -20,7 +20,6 @@ from django.utils.functional import cached_property
 from django.utils.translation import gettext_lazy as _
 from django.views.generic import (
     CreateView,
-    DeleteView,
     DetailView,
     FormView,
     ListView,
@@ -62,6 +61,7 @@ from eventyay.base.settings import (
     SUPPORTED_VIDEO_PROVIDERS,
     get_video_provider_visibility,
 )
+from eventyay.helpers.compat import CompatDeleteView
 from eventyay.control.permissions import AdministratorPermissionRequiredMixin
 from eventyay.control.tasks import clear_event_data
 from eventyay.control.video.admin_dashboard import get_video_server_config
@@ -232,12 +232,30 @@ class VideoSettings(AdministratorPermissionRequiredMixin, TemplateView):
             },
         ]
         # Active tab defaults to general
+        gs = GlobalSettingsObject()
+        ctx["video_max_connections_per_user"] = gs.settings.get("video_max_connections_per_user", as_type=int, default=0)
         ctx["active_tab"] = kwargs.get("active_tab") or self.request.GET.get("tab", "general")
         return ctx
 
     def post(self, request, *args, **kwargs):
         gs = GlobalSettingsObject()
-        changed = []
+        limit_changed = []
+        visibility_changed = []
+
+        if "video_max_connections_per_user" in request.POST:
+            val = request.POST.get("video_max_connections_per_user", "").strip()
+            try:
+                max_conn = int(val)
+                if max_conn < 0:
+                    messages.error(request, _("Max connections must be 0 or greater."))
+                else:
+                    prev_conn = gs.settings.get("video_max_connections_per_user", as_type=int, default=0)
+                    if max_conn != prev_conn:
+                        gs.settings.set("video_max_connections_per_user", max_conn)
+                        limit_changed.append(f"max connections per user: {max_conn}")
+            except (ValueError, TypeError):
+                messages.error(request, _("Invalid number for max connections."))
+
         for p in SUPPORTED_VIDEO_PROVIDERS:
             sub_key = f"video_provider_{p}_submitted"
             key_single = f"video_provider_{p}"
@@ -253,28 +271,44 @@ class VideoSettings(AdministratorPermissionRequiredMixin, TemplateView):
 
                 if new_org != prev_org:
                     gs.settings.set(org_key, new_org)
-                    changed.append(f"{p} organizer: {new_org}")
+                    visibility_changed.append(f"{p} organizer: {new_org}")
                 if new_att != prev_att:
                     gs.settings.set(att_key, new_att)
-                    changed.append(f"{p} attendee: {new_att}")
+                    visibility_changed.append(f"{p} attendee: {new_att}")
             elif sub_key in request.POST or key_single in request.POST:
                 is_enabled = request.POST.get(key_single) in ("true", "1", "on")
                 for r_key, r_name in [(org_key, "organizer"), (att_key, "attendee")]:
                     prev = gs.settings.get(r_key, as_type=bool, default=True)
                     if is_enabled != prev:
                         gs.settings.set(r_key, is_enabled)
-                        changed.append(f"{p} {r_name}: {is_enabled}")
+                        visibility_changed.append(f"{p} {r_name}: {is_enabled}")
 
-        if changed:
+        if limit_changed:
+            _admin_log_entry(
+                content_object=request.user,
+                user=request.user,
+                action_type="eventyay.video.settings.connection_limit_changed",
+                data=json.dumps({"changes": limit_changed}),
+            )
+
+        if visibility_changed:
             _admin_log_entry(
                 content_object=request.user,
                 user=request.user,
                 action_type="eventyay.video.settings.visibility_changed",
-                data=json.dumps({"changes": changed}),
+                data=json.dumps({"changes": visibility_changed}),
             )
+
+        if limit_changed and visibility_changed:
+            messages.success(request, _("Video settings and connection limits saved successfully."))
+        elif limit_changed:
+            messages.success(request, _("Video connection limit saved successfully."))
+        elif visibility_changed:
             messages.success(request, _("Video server visibility settings saved successfully."))
-        else:
+        elif not limit_changed and not visibility_changed and "video_max_connections_per_user" not in request.POST:
             messages.info(request, _("No changes made to video server visibility settings."))
+        elif not limit_changed and not visibility_changed:
+            messages.info(request, _("No changes made to video settings."))
 
         return redirect(reverse("eventyay_admin:video_admin:settings") + "?tab=general")
 
@@ -437,6 +471,9 @@ class EventAdminToken(AdministratorPermissionRequiredMixin, DetailView):
             raise Http404("Event not found")
 
     def get(self, request, *args, **kwargs):
+        return self.http_method_not_allowed(request, *args, **kwargs)
+
+    def post(self, request, *args, **kwargs):
         event = self.get_object()
 
         # Ensure JWT configuration exists
@@ -692,7 +729,7 @@ class BBBServerUpdate(AdministratorPermissionRequiredMixin, UpdateView):
         return super().form_valid(form)
 
 
-class BBBServerDelete(AdministratorPermissionRequiredMixin, DeleteView):
+class BBBServerDelete(AdministratorPermissionRequiredMixin, CompatDeleteView):
     template_name = "control/bbb_delete.html"
     queryset = BBBServer.objects.all()
     success_url = "/admin/video/bbbs/"
@@ -700,14 +737,15 @@ class BBBServerDelete(AdministratorPermissionRequiredMixin, DeleteView):
 
     def delete(self, request, *args, **kwargs):
         self.object = self.get_object()
-        _admin_log_entry(
-            content_object=self.object,
-            user=self.request.user,
-            action_type="bbbserver.deleted",
-            data={},
-        )
         success_url = self.get_success_url()
-        self.object.delete()
+        with transaction.atomic():
+            _admin_log_entry(
+                content_object=self.object,
+                user=self.request.user,
+                action_type="bbbserver.deleted",
+                data={},
+            )
+            self.object.delete()
         messages.success(self.request, _("Ok!"))
         return HttpResponseRedirect(success_url)
 
@@ -753,7 +791,7 @@ class JanusServerUpdate(AdministratorPermissionRequiredMixin, UpdateView):
         return super().form_valid(form)
 
 
-class JanusServerDelete(AdministratorPermissionRequiredMixin, DeleteView):
+class JanusServerDelete(AdministratorPermissionRequiredMixin, CompatDeleteView):
     template_name = "control/janus_delete.html"
     queryset = JanusServer.objects.all()
     success_url = "/admin/video/janus/"
@@ -761,14 +799,15 @@ class JanusServerDelete(AdministratorPermissionRequiredMixin, DeleteView):
 
     def delete(self, request, *args, **kwargs):
         self.object = self.get_object()
-        _admin_log_entry(
-            content_object=self.object,
-            user=self.request.user,
-            action_type="janusserver.deleted",
-            data={},
-        )
         success_url = self.get_success_url()
-        self.object.delete()
+        with transaction.atomic():
+            _admin_log_entry(
+                content_object=self.object,
+                user=self.request.user,
+                action_type="janusserver.deleted",
+                data={},
+            )
+            self.object.delete()
         messages.success(self.request, _("Ok!"))
         return HttpResponseRedirect(success_url)
 
@@ -814,7 +853,7 @@ class JitsiServerUpdate(AdministratorPermissionRequiredMixin, UpdateView):
         return super().form_valid(form)
 
 
-class JitsiServerDelete(AdministratorPermissionRequiredMixin, DeleteView):
+class JitsiServerDelete(AdministratorPermissionRequiredMixin, CompatDeleteView):
     template_name = "control/jitsi_delete.html"
     queryset = JitsiServer.objects.all()
     success_url = "/admin/video/jitsi/"
@@ -822,14 +861,15 @@ class JitsiServerDelete(AdministratorPermissionRequiredMixin, DeleteView):
 
     def delete(self, request, *args, **kwargs):
         self.object = self.get_object()
-        _admin_log_entry(
-            content_object=self.object,
-            user=self.request.user,
-            action_type="jitsiserver.deleted",
-            data={},
-        )
         success_url = self.get_success_url()
-        self.object.delete()
+        with transaction.atomic():
+            _admin_log_entry(
+                content_object=self.object,
+                user=self.request.user,
+                action_type="jitsiserver.deleted",
+                data={},
+            )
+            self.object.delete()
         messages.success(self.request, _("Ok!"))
         return HttpResponseRedirect(success_url)
 
@@ -882,7 +922,7 @@ class TurnServerUpdate(AdministratorPermissionRequiredMixin, UpdateView):
         return super().form_valid(form)
 
 
-class TurnServerDelete(AdministratorPermissionRequiredMixin, DeleteView):
+class TurnServerDelete(AdministratorPermissionRequiredMixin, CompatDeleteView):
     template_name = "control/turn_delete.html"
     queryset = TurnServer.objects.all()
     success_url = "/admin/video/turns/"
@@ -890,14 +930,15 @@ class TurnServerDelete(AdministratorPermissionRequiredMixin, DeleteView):
 
     def delete(self, request, *args, **kwargs):
         self.object = self.get_object()
-        _admin_log_entry(
-            content_object=self.object,
-            user=self.request.user,
-            action_type="turnserver.deleted",
-            data={},
-        )
         success_url = self.get_success_url()
-        self.object.delete()
+        with transaction.atomic():
+            _admin_log_entry(
+                content_object=self.object,
+                user=self.request.user,
+                action_type="turnserver.deleted",
+                data={},
+            )
+            self.object.delete()
         messages.success(self.request, _("Ok!"))
         return HttpResponseRedirect(success_url)
 
@@ -945,7 +986,7 @@ class LoungeMeshServerUpdate(AdministratorPermissionRequiredMixin, UpdateView):
         return super().form_valid(form)
 
 
-class LoungeMeshServerDelete(AdministratorPermissionRequiredMixin, DeleteView):
+class LoungeMeshServerDelete(AdministratorPermissionRequiredMixin, CompatDeleteView):
     template_name = "control/loungemesh_delete.html"
     queryset = LoungeMeshServer.objects.all()
     success_url = "/admin/video/loungemesh/"
@@ -953,14 +994,15 @@ class LoungeMeshServerDelete(AdministratorPermissionRequiredMixin, DeleteView):
 
     def delete(self, request, *args, **kwargs):
         self.object = self.get_object()
-        _admin_log_entry(
-            content_object=self.object,
-            user=self.request.user,
-            action_type="loungemeshserver.deleted",
-            data={},
-        )
         success_url = self.get_success_url()
-        self.object.delete()
+        with transaction.atomic():
+            _admin_log_entry(
+                content_object=self.object,
+                user=self.request.user,
+                action_type="loungemeshserver.deleted",
+                data={},
+            )
+            self.object.delete()
         messages.success(self.request, _("Ok!"))
         return HttpResponseRedirect(success_url)
 

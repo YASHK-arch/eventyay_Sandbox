@@ -8,12 +8,14 @@
     {% if current_event and current_event.locales and not is_html_export %}
         <details id="locale-dropdown-label" class="dropdown locales" aria-haspopup="menu" role="menu">
         {% with active_event_lang=request.event_language|default_if_none:current_event.locale|default_if_none:request.LANGUAGE_CODE %}
-        <summary aria-label="{% translate 'Language' %} - {{ active_event_lang|slice:':2'|title }}/{{ request.LANGUAGE_CODE|slice:':2'|title }}">
+        {% with event_lang_code=active_event_lang|slice:':2'|title ui_lang_code=request.LANGUAGE_CODE|slice:':2'|title %}
+        <summary aria-label="{% translate 'Language' %} - {% if request.event_language_enforce_ui or event_lang_code|lower == ui_lang_code|lower %}{{ event_lang_code }}{% else %}{{ event_lang_code }}/{{ ui_lang_code }}{% endif %}">
             <i class="fa fa-globe" aria-hidden="true"></i>
-            <span class="hidden-xs" aria-hidden="true">{{ active_event_lang|slice:':2'|title }}/{{ request.LANGUAGE_CODE|slice:':2'|title }}</span>
+            <span class="hidden-xs" aria-hidden="true">{% if request.event_language_enforce_ui or event_lang_code|lower == ui_lang_code|lower %}{{ event_lang_code }}{% else %}{{ event_lang_code }}/{{ ui_lang_code }}{% endif %}</span>
             <i class="fa fa-caret-down ml-1 hidden-xs" aria-hidden="true"></i>
         </summary>
-            <div id="locale-dropdown" class="dropdown-content dropdown-content-s{% if rtl %}e{% else %}w{% endif %}">
+        {% endwith %}
+            <div id="locale-dropdown" class="dropdown-content dropdown-content-s{% if rtl %}e{% else %}w{% endif %} language-selector">
                 <div class="language-enforce-bar">
                     <span id="language-enforce-label" class="language-enforce-label">{% translate "Link languages" %}</span>
                     <form method="get" action="{% url 'presale:locale.event' %}" class="language-enforce-form">
@@ -100,10 +102,6 @@
                     {% translate "My orders" %}
                 </a>
                 {% if current_event %}
-                    <a href="{% url 'eventyay_common:orders' %}?event={{ current_event.pk }}" class="dropdown-item" role="menuitem" tabindex="-1">
-                        <i class="fa fa-ticket"></i>
-                        {% translate "My tickets" %}
-                    </a>
                     {% if current_event.talks_published %}
                         {% user_has_submissions current_event as has_cfp_submissions %}
                         {% if has_cfp_submissions %}
@@ -118,7 +116,7 @@
                             </a>
                             <a href="{{ current_event.urls.user_mails }}" class="dropdown-item" role="menuitem" tabindex="-1">
                                 <i class="fa fa-envelope"></i>
-                                {% translate "Speaker Emails" %}
+                                {% translate "Speaker emails" %}
                             </a>
                         {% endif %}
                     {% endif %}

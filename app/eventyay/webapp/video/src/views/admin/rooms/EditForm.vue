@@ -48,8 +48,8 @@
 							.setting-control
 								bunt-switch(name="force_join", v-model="config.force_join")
 
-			component.stage-settings(ref="settings", v-if="inferredType && typeComponents[inferredType.id]", :is="typeComponents[inferredType.id]", :config="config", :modules="modules", :creating="creating")
-			sidebar-addons(v-if="inferredType && (inferredType.id === 'stage' || inferredType.id === 'channel-janus' || inferredType.id === 'channel-zoom' || inferredType.id === 'channel-loungemesh')", :config="config", :modules="modules", :creating="creating")
+			component.stage-settings(ref="settings", v-if="inferredType && typeComponents[inferredType.id] && !isProviderDisabled", :is="typeComponents[inferredType.id]", :config="config", :modules="modules", :creating="creating")
+			sidebar-addons(v-if="!isProviderDisabled && inferredType && (inferredType.id === 'stage' || inferredType.id === 'channel-janus' || inferredType.id === 'channel-zoom' || inferredType.id === 'channel-loungemesh')", :config="config", :modules="modules", :creating="creating")
 			.danger-zone(v-if="!creating && hasPermission('room:delete')")
 				h3 {{ $t('Danger Zone') }}
 				template(v-if="config.has_linked_sessions")
@@ -72,8 +72,7 @@
 							) {{ $t('Delete this room') }}
 	.ui-form-actions
 		bunt-button.btn-save(@click="save", :loading="saving", :error="!!error") {{ creating ? $t('Create') : $t('Save') }}
-		bunt-button.btn-sync(v-if="!creating && interpretationAdmin.usePluginStreams", @click="syncServices", :loading="syncing", :error="!!syncError", style="margin-left: 10px") {{ $t('Sync Services') }}
-		.errors {{ error || syncError || validationErrors.join(', ') }}
+		.errors {{ error || validationErrors.join(', ') }}
 </template>
 <script>
 import { markRaw } from 'vue'
@@ -84,6 +83,7 @@ import { required } from 'lib/validators'
 import ValidationErrorsMixin from 'components/mixins/validation-errors'
 import ROOM_TYPES, { inferType, isChatChannel } from 'lib/room-types'
 import { filterRoomTypesByPermission } from 'lib/room-type-permissions'
+import { MODULE_TYPE_TO_PROVIDER, isVideoProviderDisabled } from 'lib/video-providers'
 import Stage from './types-edit/stage'
 import ChannelBBB from './types-edit/channel-bbb'
 import ChannelJanus from './types-edit/channel-janus'
@@ -96,7 +96,6 @@ import {
 	cloneLanguageStreamEntries,
 	fetchInterpretationLanguageStreams,
 	saveInterpretationLanguageStreams,
-	syncInterpretationServices,
 } from 'lib/interpretation-language-streams'
 
 export default {
@@ -132,9 +131,7 @@ export default {
 				'channel-loungemesh': ChannelLoungeMesh,
 			}),
 			saving: false,
-			syncing: false,
 			error: null,
-			syncError: null,
 			confirmingDelete: false,
 			deletingRoomName: '',
 			deleting: false,
@@ -165,6 +162,19 @@ export default {
 				acc[module.type] = module
 				return acc
 			}, {})
+		},
+		isProviderDisabled() {
+			const videoProviders = this.$store.state.world?.video_providers || window.eventyay?.video_providers
+			if (!videoProviders) return false
+			const modules = this.config?.modules || this.config?.module_config || []
+			for (const m of modules) {
+				const type = typeof m === 'string' ? m : m?.type
+				const providerId = MODULE_TYPE_TO_PROVIDER[type]
+				if (providerId && isVideoProviderDisabled(providerId, videoProviders)) {
+					return true
+				}
+			}
+			return false
 		},
 		inferredType() {
 			return inferType(this.config)
@@ -245,12 +255,13 @@ export default {
 			this.saving = true
 			try {
 				let roomId = this.config.id
-				if (this.creating) {
+				if (this.creating && !this.config.id) {
 					({ room: roomId } = await this.$store.dispatch('createRoom', {
 						name: this.config.name,
 						description: this.config.description,
 						modules: []
 					}))
+					this.config.id = roomId
 				}
 				let moduleConfig = this.config.module_config || []
 				if (['channel-bbb', 'channel-jitsi'].includes(this.inferredType?.id)) {
@@ -275,6 +286,10 @@ export default {
 					} catch (e) {
 						console.warn('Failed to store streamScheduleDraft in sessionStorage:', e)
 					}
+				}
+
+				if (this.$refs.settings?.saveInterpretationConfig) {
+					await this.$refs.settings.saveInterpretationConfig(roomId)
 				}
 
 				if (this.$refs.settings?.saveStreamSchedules) {
@@ -308,16 +323,6 @@ export default {
 				this.saving = false
 				this.error = error.message || error
 			}
-		},
-		async syncServices() {
-			this.syncError = null
-			this.syncing = true
-			try {
-				await syncInterpretationServices(this.$store, this.config.id)
-			} catch (error) {
-				this.syncError = error.message || error
-			}
-			this.syncing = false
 		},
 		cancelDelete() {
 			this.confirmingDelete = false

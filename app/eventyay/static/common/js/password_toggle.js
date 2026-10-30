@@ -88,7 +88,11 @@ export function initPasswordToggles(root = document) {
                 }
             }
         });
-        
+
+        const container = btn.closest('.password-input-wrapper');
+        const input = container && container.querySelector('input[type="password"]');
+        if (input) input.classList.add('password-toggle-initialized');
+
         btn.dataset.passwordToggleBound = 'true';
     });
 }

@@ -5,15 +5,16 @@
 {% load money %}
 {% load static %}
 
-{% block title %}{% trans "My Tickets" %}{% endblock %}
+{% block title %}{% trans "My orders" %}{% endblock %}
 
 {% block custom_header %}
     {{ block.super }}
+    <link rel="stylesheet" href="{% static 'eventyay-common/css/common_dashboard.css' %}">
     <script type="module" src="{% static 'eventyay-common/js/orders-filter.js' %}"></script>
 {% endblock %}
 
 {% block content %}
-    <h1>{% trans "My Tickets" %}</h1>
+    <h1>{% trans "My orders" %}</h1>
     <div class="advanced-filter-search" data-advanced-filter-search>
         <form class="filter-form advanced-filter-search-form" action="" method="get">
             <div class="advanced-filter-search-bar">

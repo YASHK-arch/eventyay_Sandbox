@@ -8,20 +8,29 @@
 				.room-name(v-else-if="call") {{ $t('Private call') }}
 			.global-placeholder
 			bunt-icon-button(@click.prevent.stop="$emit('close')") close
-	Livestream(v-if="room && shouldUseLivestream", ref="livestream", :room="room", :module="module", :size="background ? 'tiny' : 'normal'", :key="`livestream-${room.id}`", @playback-state-changed="onMainPlayerPlaybackChanged")
-	VideoCallFrame(v-else-if="room && isVideoCall", ref="videoCallFrame", :room="room", :module="module", :background="background", :size="background ? 'tiny' : 'normal'", :key="`call-${room.id}`", @close="$emit('close')", @leave="$emit('leave', room)")
-	VideoCallFrame(v-else-if="call", ref="channelCallFrame", :call="call", :background="background", :size="background ? 'tiny' : 'normal'", :key="`call-${call.id}`", @close="$emit('close')", @leave="$emit('leave', null)")
+	Livestream(v-if="room && shouldUseLivestream", ref="livestream", :room="room", :module="module", :size="background ? 'tiny' : 'normal'", :key="`livestream-${room.id}-${playerEpoch}`", @playback-state-changed="onMainPlayerPlaybackChanged")
+	VideoCallFrame(v-else-if="room && isVideoCall", ref="videoCallFrame", :room="room", :module="module", :background="background", :size="background ? 'tiny' : 'normal'", :key="`call-${room.id}-${playerEpoch}`", @close="$emit('close')", @leave="$emit('leave', room)")
+	VideoCallFrame(v-else-if="call", ref="channelCallFrame", :call="call", :background="background", :size="background ? 'tiny' : 'normal'", :key="`call-${call.id}-${playerEpoch}`", @close="$emit('close')", @leave="$emit('leave', null)")
 	.iframe-consent-gate(v-if="consentBlockedUrl && !background")
 		iframe-blocker(:src="consentBlockedUrl", allow="camera *; autoplay *; microphone *; fullscreen *; display-capture *", allowfullscreen, @consent-given="onConsentGiven")
-	.iframe-error(v-if="!iframeEl && !consentBlockedUrl && (iframeError || iframeOffline)", :class="{background: background, 'size-tiny': background}")
-		.offline-message(v-if="iframeOffline") {{ $t('Stream offline') }}
-		.offline-message(v-else) {{ $t('We could not connect to the video conference server, sorry.') }}
+	.iframe-error(v-if="!shouldUseLivestream && !iframeEl && !consentBlockedUrl && (scheduleAwaitingStream || iframeError || iframeOffline)", :class="{background: background, 'size-tiny': background}")
+		bunt-progress-circular(v-if="scheduleAwaitingStream", size="large")
+		.offline-card(v-else-if="iframeOffline")
+			.mdi.mdi-video-off-outline
+			.offline-title {{ $t('Stream offline') }}
+			.offline-subtitle {{ $t('The livestream is currently not broadcasting.') }}
+		.error-card(v-else)
+			.mdi.mdi-alert-circle-outline
+			.error-title {{ $t('Connection Failed') }}
+			.error-subtitle {{ iframeError && iframeError.message ? iframeError.message : $t('We could not connect to the video conference server, sorry.') }}
+			bunt-button.btn-retry(v-if="!background", @click="retryIframe") {{ $t('Retry Connection') }}
 	iframe#video-player-translation(v-if="languageIframeUrl", ref="translationIframeEl", :src="languageIframeUrl", style="position: absolute; width: 1px; height: 1px; opacity: 0; pointer-events: none;", frameborder="0", gesture="media", allow="autoplay; encrypted-media", referrerpolicy="strict-origin-when-cross-origin", @load="onTranslationIframeLoaded")
 	audio(ref="whepAudioEl", autoplay, style="display: none;")
 </template>
 <script setup>
 // TODO functional component?
-import { ref, computed, watch, onMounted, onBeforeUnmount } from 'vue';
+import { defineAsyncComponent, h, inject, provide, ref, computed, watch, onMounted, onBeforeUnmount } from 'vue';
+import { translate } from 'i18n';
 import { useRoute, useRouter } from 'vue-router';
 import { useStore } from 'vuex';
 import { isEqual } from 'lodash';
@@ -30,10 +39,6 @@ import {logOperational} from 'lib/operationalLog';
 import { normalizeYoutubeVideoId } from 'lib/validators';
 import { isDomainBlocked, getUrlDomain } from 'lib/iframeConsent';
 import IframeBlocker from 'components/IframeBlocker';
-import VideoCallFrame from 'components/VideoCallFrame';
-import JanusCall from 'components/JanusCall';
-import JanusChannelCall from 'components/JanusChannelCall';
-import Livestream from 'components/Livestream';
 import { WhepClient } from 'lib/webrtc/whep';
 import {
 	getStagePlaybackMode,
@@ -45,12 +50,45 @@ import {
 import { getVimeoEmbedUrl, parseVimeoUrl } from 'lib/vimeo';
 import { isRoomVisibleToAttendee } from 'lib/video-providers';
 
+const PLAYER_LOAD_ATTEMPTS = 3
+const retryVideoPlayerKey = Symbol('retryVideoPlayer')
 
+const PlayerLoadError = {
+	name: 'PlayerLoadError',
+	setup() {
+		const retry = inject(retryVideoPlayerKey, null)
+		return () => h('div', { class: 'player-load-error', role: 'alert' }, [
+			h('p', translate('We could not load the video player.')),
+			h('button', {
+				type: 'button',
+				onClick: () => {
+					if (typeof retry === 'function') retry()
+				},
+			}, translate('Try again')),
+		])
+	},
+}
 
-// Props & Emits
-defineOptions({
-	components: { Livestream, VideoCallFrame, JanusCall, JanusChannelCall, IframeBlocker },
-});
+function loadPlayer(loader, label) {
+	return defineAsyncComponent({
+		loader: () => loader().catch((error) => {
+			console.error('Failed to load video player module', label, error)
+			throw error
+		}),
+		onError(_error, retry, fail, attempts) {
+			if (attempts < PLAYER_LOAD_ATTEMPTS) {
+				retry()
+				return
+			}
+			fail()
+		},
+		errorComponent: PlayerLoadError,
+	})
+}
+
+const Livestream = loadPlayer(() => import('components/Livestream'), 'Livestream')
+const VideoCallFrame = loadPlayer(() => import('components/VideoCallFrame'), 'VideoCallFrame')
+
 const props = defineProps({
 	room: Object,
 	call: Object,
@@ -60,6 +98,10 @@ const props = defineProps({
 	},
 });
 const emit = defineEmits(['close', 'leave']);
+const playerEpoch = ref(0)
+provide(retryVideoPlayerKey, () => {
+	playerEpoch.value += 1
+})
 
 const store = useStore();
 const route = useRoute();
@@ -170,14 +212,16 @@ const isScheduleDrivenStage = computed(() =>
 const shouldUseLivestream = computed(() => {
 	if (isRoomDisabled.value) return false;
 	if (!props.room || !module.value) return false;
-	const streamType = isScheduleDrivenStage.value ? props.room?.currentStream?.stream_type : null;
-
-	if (streamType) {
-		return streamType === STREAM_TYPE_HLS;
+	if (isScheduleDrivenStage.value) {
+		return props.room?.currentStream?.stream_type === STREAM_TYPE_HLS;
 	}
 
 	return module.value.type === 'livestream.native';
 });
+
+const scheduleAwaitingStream = computed(() => (
+	isScheduleDrivenStage.value && props.room?.currentStream === undefined
+));
 
 // When stream schedules are enabled, the backend returns 404 (mapped to null) if
 // no stream is currently active. For iframe-based streams we show a full-size
@@ -193,6 +237,7 @@ const iframeOffline = computed(() => {
 	const currentStream = isScheduleDriven ? props.room?.currentStream : null;
 	const streamType = currentStream?.stream_type;
 	const moduleType = module.value.type;
+	if (isScheduleDriven && !currentStream?.url) return true;
 	const isYouTube = streamType === STREAM_TYPE_YOUTUBE || moduleType === 'livestream.youtube';
 	const isVimeo = streamType === STREAM_TYPE_VIMEO || moduleType === 'livestream.vimeo';
 
@@ -982,6 +1027,11 @@ function onConsentGiven(persistent) {
 	initializeIframe(false, true)
 }
 
+function retryIframe() {
+	iframeError.value = null
+	initializeIframe(false, false)
+}
+
 function isPlaying() {
 	if (props.call) {
 		return janus.value?.roomId;
@@ -1139,11 +1189,29 @@ iframe.iframe-media-source
 	height: var(--mediasource-placeholder-height, var(--mobile-media-height, 40vh))
 	.c-iframe-blocker
 		flex: auto
+.c-media-source .player-load-error
+	display: flex
+	flex-direction: column
+	align-items: center
+	justify-content: center
+	gap: 12px
+	box-sizing: border-box
+	width: var(--mediasource-placeholder-width, 100%)
+	min-height: 120px
+	padding: 16px
+	text-align: center
+	background-color: $clr-blue-grey-200
+	color: $clr-secondary-text-light
+	p
+		margin: 0
+	button
+		font: inherit
+		cursor: pointer
 .c-media-source .iframe-error
 	display: flex
 	justify-content: center
 	align-items: center
-	background-color: $clr-blue-grey-200
+	background-color: #1e293b
 	z-index: 1
 	overflow: hidden
 	// Fallbacks prevent the overlay from shrinking to its text when
@@ -1156,13 +1224,33 @@ iframe.iframe-media-source
 		height: 48px
 		pointer-events: none
 		z-index: 101
-	.offline-message
-		font-size: 36px
-		color: $clr-secondary-text-light
+	.offline-card, .error-card
+		display: flex
+		flex-direction: column
+		align-items: center
+		justify-content: center
+		gap: 12px
+		padding: 24px
 		text-align: center
-		padding: 16px
-	&.size-tiny, &.background
-		.offline-message
+		color: #f8fafc
+		.mdi
+			font-size: 48px
+			color: #ef4444
+		.error-title, .offline-title
+			font-size: 18px
+			font-weight: 600
+			margin: 0
+		.error-subtitle, .offline-subtitle
 			font-size: 14px
-			padding: 8px
+			color: #94a3b8
+			max-width: 480px
+			margin: 0
+		.btn-retry
+			background-color: #2185d0
+			color: #ffffff
+			border-radius: 6px
+			margin-top: 8px
+	&.size-tiny, &.background
+		.offline-card, .error-card
+			display: none
 </style>
