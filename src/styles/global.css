@@ -1,0 +1,9 @@
+/* Global styles */
+
+/* Existing global styles ... */
+
+/* Dropdown portal utility class to ensure dropdown menus escape overflow containers */
+.dropdown-portal {
+  position: fixed;
+  z-index: var(--z-index-dropdown, 1000);
+}
